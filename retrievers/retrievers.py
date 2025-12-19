@@ -11,6 +11,17 @@ from ..models import Chunk
 from ..vectorstore import VectorStore
 from ..embedding import Embedder
 
+# クロスエンコーダのインポート（オプショナル）
+# コメントアウト: rerankは処理が重く改善が少ないため無効化
+# try:
+#     from sentence_transformers import CrossEncoder
+#     CROSS_ENCODER_AVAILABLE = True
+# except ImportError:
+#     CROSS_ENCODER_AVAILABLE = False
+#     CrossEncoder = None
+CROSS_ENCODER_AVAILABLE = False
+CrossEncoder = None
+
 
 class Retriever:
     """検索・リトリーバルのベースクラス（拡張可能）"""
@@ -79,6 +90,9 @@ class Retriever:
         """
         再ランキング（拡張用のメソッド）
         
+        サブクラスで実装してください。再ランキングを実装しない場合は、
+        そのまま返すか、top_kでスライスするだけの実装でも構いません。
+        
         Args:
             query: クエリ
             chunks_with_scores: チャンクとスコアのタプルリスト
@@ -87,51 +101,12 @@ class Retriever:
         Returns:
             再ランキング後のチャンクとスコアのリスト
         """
-        # ベース実装：そのまま返す（拡張可能）
+        # デフォルト実装：再ランキングを行わず、top_kでスライスするだけ
+        # サブクラスでオーバーライドして、実際の再ランキングを実装してください
         if top_k is not None:
             return chunks_with_scores[:top_k]
         return chunks_with_scores
 
-
-# def _infer_content_type_from_query(query: str) -> Optional[str]:
-#     """クエリから content_type を推論する
-    
-#     Args:
-#         query: 検索クエリ
-        
-#     Returns:
-#         推論されたcontent_type（Noneの場合はフィルタリングしない）
-#     """
-#     q = (query or "").lower()
-    
-#     # 具体例を求めている場合
-#     example_keywords = [
-#         "具体例", "例", "example", "例えば", "例を", "例を挙げて", 
-#         "例を示して", "例を教えて", "サンプル", "sample"
-#     ]
-#     if any(kw in q for kw in example_keywords):
-#         return "example"
-    
-#     # 定義を求めている場合
-#     definition_keywords = [
-#         "定義", "definition", "とは", "とは何", "意味", "意味は", 
-#         "説明して", "説明", "何か", "何", "what is", "what's"
-#     ]
-#     if any(kw in q for kw in definition_keywords):
-#         return "short"
-    
-#     # 論理・手順・プロセスについて聞いている場合
-#     procedure_keywords = [
-#         "論理", "logic", "手順", "プロセス", "process", "流れ", 
-#         "導出", "derivation", "なぜ", "理由", "reason", "how", 
-#         "どのように", "どうやって", "方法", "method", "よって", 
-#         "したがって", "therefore", "thus", "step", "ステップ"
-#     ]
-#     if any(kw in q for kw in procedure_keywords):
-#         return "procedure"
-    
-#     # マッチしない場合はNoneを返す（フィルタリングしない）
-#     return None
 
 
 class SimpleRetriever(Retriever):
@@ -143,20 +118,46 @@ class SimpleRetriever(Retriever):
         embedder: Embedder,
         min_quality_score: float = 0.4,
         min_avg_adj_similarity: float = 0.3,
-        excluded_page_numbers: Optional[List[int]] = None
+        excluded_page_numbers: Optional[List[int]] = None,
+        use_rerank: bool = False,  # デフォルトで無効化
+        rerank_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        rerank_top_k: int = 5,
+        initial_retrieval_top_n: int = 15
     ):
         """
         Args:
             vector_store: ベクトルストア
             embedder: 埋め込み生成器
-            min_quality_score: 最小quality_score閾値（デフォルト: 0.6）
-            min_avg_adj_similarity: 最小avg_adj_similarity閾値（デフォルト: 0.4）
+            min_quality_score: 最小quality_score閾値（デフォルト: 0.4）
+            min_avg_adj_similarity: 最小avg_adj_similarity閾値（デフォルト: 0.3）
             excluded_page_numbers: 除外するページ番号のリスト（デフォルト: [7, 10]）
+            use_rerank: 再ランキングを使用するか（デフォルト: False、現在は無効化）
+            rerank_model_name: クロスエンコーダモデル名（現在は使用されていません）
+            rerank_top_k: 再ランキング後の取得数（現在は使用されていません）
+            initial_retrieval_top_n: 初期検索で取得するチャンク数（現在は使用されていません）
         """
         super().__init__(vector_store, embedder)
         self.min_quality_score = min_quality_score
         self.min_avg_adj_similarity = min_avg_adj_similarity
         self.excluded_page_numbers = excluded_page_numbers if excluded_page_numbers is not None else [7, 10]
+        self.use_rerank = use_rerank
+        self.rerank_top_k = rerank_top_k
+        self.initial_retrieval_top_n = initial_retrieval_top_n
+        
+        # クロスエンコーダの初期化（コメントアウト: rerankは処理が重く改善が少ないため無効化）
+        self.cross_encoder = None
+        # if use_rerank:
+        #     if not CROSS_ENCODER_AVAILABLE:
+        #         print("警告: sentence-transformersがインストールされていません。再ランキングは無効化されます。")
+        #         print("インストール方法: pip install sentence-transformers")
+        #         self.use_rerank = False
+        #     else:
+        #         try:
+        #             self.cross_encoder = CrossEncoder(rerank_model_name)
+        #         except Exception as e:
+        #             print(f"警告: クロスエンコーダの初期化に失敗しました: {str(e)}")
+        #             print("再ランキングは無効化されます。")
+        #             self.use_rerank = False
     
     def retrieve(
         self,
@@ -223,11 +224,99 @@ class SimpleRetriever(Retriever):
             results = filtered_results
             filter_stats["total_after_filter"] = len(results)
         
-        final_results = results[:top_k]
+        # 再ランキングを適用（コメントアウト: rerankは処理が重く改善が少ないため無効化）
+        # if self.use_rerank and self.cross_encoder is not None:
+        #     # 初期検索で topN を取得
+        #     initial_results = results[:self.initial_retrieval_top_n]
+        #     # 再ランキングで topK に絞る
+        #     results = self.rerank(query, initial_results, top_k=self.rerank_top_k)
+        #     if return_filter_stats:
+        #         filter_stats["total_after_rerank"] = len(results)
+        # else:
+        #     # 再ランキングを使用しない場合は、指定された top_k で取得
+        #     final_results = results[:top_k]
+        #     if return_filter_stats:
+        #         return final_results, filter_stats
+        #     return final_results
         
+        # 再ランキングを使用しない場合は、指定された top_k で取得
+        final_results = results[:top_k]
         if return_filter_stats:
             return final_results, filter_stats
         return final_results
+    
+    # 再ランキングメソッド（コメントアウト: rerankは処理が重く改善が少ないため無効化）
+    # def rerank(
+    #     self,
+    #     query: str,
+    #     chunks_with_scores: List[Tuple[Chunk, float]],
+    #     top_k: Optional[int] = None
+    # ) -> List[Tuple[Chunk, float]]:
+    #     """
+    #     再ランキング（クロスエンコーダを使用）
+    #     
+    #     Args:
+    #         query: クエリ
+    #         chunks_with_scores: チャンクとスコアのタプルリスト
+    #         top_k: 再ランキング後の取得数（Noneの場合は全て）
+    #         
+    #     Returns:
+    #         再ランキング後のチャンクとスコアのリスト
+    #     """
+    #     if self.use_rerank and self.cross_encoder is not None:
+    #         return self._rerank_with_cross_encoder(query, chunks_with_scores, top_k)
+    #     
+    #     # クロスエンコーダが使用できない場合は、そのまま返す
+    #     if top_k is not None:
+    #         return chunks_with_scores[:top_k]
+    #     return chunks_with_scores
+    
+    # def _rerank_with_cross_encoder(
+    #     self,
+    #     query: str,
+    #     chunks_with_scores: List[Tuple[Chunk, float]],
+    #     top_k: Optional[int] = None
+    # ) -> List[Tuple[Chunk, float]]:
+    #     """
+    #     クロスエンコーダを使用した再ランキング
+    #     
+    #     Args:
+    #         query: クエリ
+    #         chunks_with_scores: チャンクとスコアのタプルリスト
+    #         top_k: 再ランキング後の取得数（Noneの場合は全て）
+    #         
+    #     Returns:
+    #         再ランキング後のチャンクとスコアのリスト
+    #     """
+    #     if not chunks_with_scores:
+    #         return []
+    #     
+    #     # クエリとチャンクのペアを作成
+    #     pairs = [[query, chunk.content] for chunk, _ in chunks_with_scores]
+    #     
+    #     # クロスエンコーダでスコアを計算
+    #     try:
+    #         rerank_scores = self.cross_encoder.predict(pairs)
+    #     except Exception as e:
+    #         print(f"警告: クロスエンコーダの予測に失敗しました: {str(e)}")
+    #         # エラーが発生した場合は元のスコアを使用
+    #         if top_k is not None:
+    #             return chunks_with_scores[:top_k]
+    #         return chunks_with_scores
+    #     
+    #     # スコアでソート（降順）
+    #     reranked_indices = np.argsort(rerank_scores)[::-1]
+    #     
+    #     # 再ランキング後の結果を作成
+    #     reranked_results = [
+    #         (chunks_with_scores[i][0], float(rerank_scores[i]))
+    #         for i in reranked_indices
+    #     ]
+    #     
+    #     # top_k で絞る
+    #     if top_k is not None:
+    #         return reranked_results[:top_k]
+    #     return reranked_results
     
     def _apply_default_filters(
         self,
@@ -258,12 +347,6 @@ class SimpleRetriever(Retriever):
             "active_filters": []
         }
         
-        # # クエリからcontent_typeを推論
-        # inferred_content_type = _infer_content_type_from_query(query)
-        # stats["inferred_content_type"] = inferred_content_type
-        
-        # if inferred_content_type is not None:
-        #     stats["active_filters"].append(f"content_type={inferred_content_type}")
         
         stats["active_filters"].extend([
             f"quality_score>={self.min_quality_score}",
@@ -300,14 +383,6 @@ class SimpleRetriever(Retriever):
                 except (ValueError, TypeError):
                     # avg_adj_similarityが数値でない場合はスキップ（フィルタリングしない）
                     pass
-            
-            # # content_type フィルタリング（クエリから推論された場合のみ）
-            # if inferred_content_type is not None:
-            #     chunk_content_type = metadata.get("content_type")
-            #     if chunk_content_type != inferred_content_type:
-            #         stats["filtered_by_content_type"] += 1
-            #         filtered_out = True
-            #         continue
             
             # page_number フィルタリング
             page_number = metadata.get("page_number")
