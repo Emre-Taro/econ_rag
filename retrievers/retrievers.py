@@ -4,8 +4,10 @@
 Retrieverとその実装クラスを定義
 """
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 import numpy as np
+import re
+from collections import Counter
 
 from ..models import Chunk
 from ..vectorstore import VectorStore
@@ -122,7 +124,11 @@ class SimpleRetriever(Retriever):
         use_rerank: bool = False,  # デフォルトで無効化
         rerank_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         rerank_top_k: int = 5,
-        initial_retrieval_top_n: int = 15
+        initial_retrieval_top_n: int = 15,
+        use_query_expansion: bool = True,  # クエリ拡張を有効化
+        expansion_top_k: int = 3,  # 拡張に使用する初期検索結果数
+        expansion_num_terms: int = 5,  # 拡張に追加する語句数
+        expansion_weight: float = 0.5  # 拡張クエリの重み（0.0-1.0）
     ):
         """
         Args:
@@ -135,6 +141,10 @@ class SimpleRetriever(Retriever):
             rerank_model_name: クロスエンコーダモデル名（現在は使用されていません）
             rerank_top_k: 再ランキング後の取得数（現在は使用されていません）
             initial_retrieval_top_n: 初期検索で取得するチャンク数（現在は使用されていません）
+            use_query_expansion: クエリ拡張を使用するか（デフォルト: True）
+            expansion_top_k: 拡張に使用する初期検索結果数（デフォルト: 3）
+            expansion_num_terms: 拡張に追加する語句数（デフォルト: 5）
+            expansion_weight: 拡張クエリの重み（0.0-1.0、デフォルト: 0.5）
         """
         super().__init__(vector_store, embedder)
         self.min_quality_score = min_quality_score
@@ -143,6 +153,10 @@ class SimpleRetriever(Retriever):
         self.use_rerank = use_rerank
         self.rerank_top_k = rerank_top_k
         self.initial_retrieval_top_n = initial_retrieval_top_n
+        self.use_query_expansion = use_query_expansion
+        self.expansion_top_k = expansion_top_k
+        self.expansion_num_terms = expansion_num_terms
+        self.expansion_weight = expansion_weight
         
         # クロスエンコーダの初期化（コメントアウト: rerankは処理が重く改善が少ないため無効化）
         self.cross_encoder = None
@@ -224,6 +238,17 @@ class SimpleRetriever(Retriever):
             results = filtered_results
             filter_stats["total_after_filter"] = len(results)
         
+        # クエリ拡張を適用
+        if self.use_query_expansion and len(results) > 0:
+            expanded_results = self._apply_query_expansion(query, results, top_k)
+            if return_filter_stats:
+                filter_stats["query_expansion_applied"] = True
+                filter_stats["expansion_terms"] = self._extract_expansion_terms(
+                    results[:self.expansion_top_k], 
+                    original_query=query
+                )
+            results = expanded_results
+        
         # 再ランキングを適用（コメントアウト: rerankは処理が重く改善が少ないため無効化）
         # if self.use_rerank and self.cross_encoder is not None:
         #     # 初期検索で topN を取得
@@ -239,7 +264,7 @@ class SimpleRetriever(Retriever):
         #         return final_results, filter_stats
         #     return final_results
         
-        # 再ランキングを使用しない場合は、指定された top_k で取得
+        # 最終結果を top_k で取得
         final_results = results[:top_k]
         if return_filter_stats:
             return final_results, filter_stats
@@ -409,4 +434,220 @@ class SimpleRetriever(Retriever):
             if chunk.metadata.get(key) != value:
                 return False
         return True
+    
+    def _extract_keywords(self, text: str, min_length: int = 2) -> List[str]:
+        """
+        テキストからキーワードを抽出
+        
+        Args:
+            text: 抽出対象のテキスト
+            min_length: 最小文字数
+            
+        Returns:
+            キーワードのリスト
+        """
+        # 日本語と英語の単語を抽出
+        # 日本語: ひらがな、カタカナ、漢字の連続
+        # 英語: アルファベットの連続
+        japanese_pattern = r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+'
+        english_pattern = r'[a-zA-Z]+'
+        
+        keywords = []
+        # 日本語の単語を抽出
+        japanese_words = re.findall(japanese_pattern, text)
+        keywords.extend([w for w in japanese_words if len(w) >= min_length])
+        
+        # 英語の単語を抽出
+        english_words = re.findall(english_pattern, text)
+        keywords.extend([w.lower() for w in english_words if len(w) >= min_length])
+        
+        return keywords
+    
+    def _extract_expansion_terms(
+        self, 
+        top_results: List[Tuple[Chunk, float]],
+        original_query: Optional[str] = None
+    ) -> List[str]:
+        """
+        検索結果から拡張用の語句を抽出
+        
+        Args:
+            top_results: 上位の検索結果
+            original_query: 元のクエリ（キーワード除外用）
+            
+        Returns:
+            拡張用の語句リスト
+        """
+        if not top_results:
+            return []
+        
+        # 全てのチャンクからキーワードを抽出
+        all_keywords = []
+        for chunk, score in top_results:
+            keywords = self._extract_keywords(chunk.content)
+            all_keywords.extend(keywords)
+        
+        # 頻度をカウント
+        keyword_counts = Counter(all_keywords)
+        
+        # 元のクエリのキーワードを除外
+        query_keywords = set()
+        if original_query:
+            query_keywords = set(self._extract_keywords(original_query))
+        
+        # 頻度の高いキーワードを選択（元のクエリに含まれないもの）
+        expansion_terms = [
+            term for term, count in keyword_counts.most_common(self.expansion_num_terms * 2)
+            if term not in query_keywords
+        ]
+        
+        return expansion_terms[:self.expansion_num_terms]
+    
+    def _apply_query_expansion(
+        self,
+        original_query: str,
+        initial_results: List[Tuple[Chunk, float]],
+        top_k: int
+    ) -> List[Tuple[Chunk, float]]:
+        """
+        クエリ拡張を適用して検索結果を改善
+        
+        Args:
+            original_query: 元のクエリ
+            initial_results: 初期検索結果
+            top_k: 最終的に取得するチャンク数
+            
+        Returns:
+            拡張後の検索結果
+        """
+        if not initial_results or len(initial_results) < self.expansion_top_k:
+            return initial_results
+        
+        # 上位の検索結果から拡張語句を抽出
+        top_results = initial_results[:self.expansion_top_k]
+        expansion_terms = self._extract_expansion_terms(top_results, original_query=original_query)
+        
+        if not expansion_terms:
+            return initial_results
+        
+        # 拡張クエリを作成
+        expanded_query = f"{original_query} {' '.join(expansion_terms)}"
+        
+        # クエリ拡張の情報を出力
+        print("\n" + "=" * 80)
+        print("[クエリ拡張]")
+        print(f"元のクエリ: {original_query}")
+        print(f"抽出された拡張語句: {', '.join(expansion_terms)}")
+        print(f"拡張後のクエリ: {expanded_query}")
+        print("=" * 80 + "\n")
+        
+        # 拡張クエリで再検索（フィルタリングなしで高速に検索）
+        expanded_results = self._search_with_query(expanded_query, top_k * 2)
+        
+        # 元のクエリと拡張クエリの結果をマージ
+        merged_results = self._merge_search_results(
+            original_query,
+            initial_results,
+            expanded_query,
+            expanded_results,
+            top_k
+        )
+        
+        return merged_results
+    
+    def _search_with_query(
+        self,
+        query: str,
+        top_k: int,
+        apply_filters: bool = False
+    ) -> List[Tuple[Chunk, float]]:
+        """
+        クエリで検索を実行（フィルタリングなしの高速版）
+        
+        Args:
+            query: 検索クエリ
+            top_k: 取得するチャンク数
+            apply_filters: フィルタリングを適用するか
+            
+        Returns:
+            検索結果
+        """
+        if len(self.vector_store.chunks) == 0:
+            return []
+        
+        # クエリを埋め込み
+        query_embedding = self.embedder.embed(query)
+        
+        # コサイン類似度を計算
+        scores = []
+        for embedding in self.vector_store.embeddings:
+            similarity = np.dot(query_embedding, embedding) / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(embedding)
+            )
+            scores.append(similarity)
+        
+        # スコアでソート
+        indices = np.argsort(scores)[::-1]  # 降順
+        
+        # チャンクとスコアを取得
+        results = [
+            (self.vector_store.chunks[i], float(scores[i]))
+            for i in indices
+        ]
+        
+        # フィルタリングを適用（オプション）
+        if apply_filters:
+            results, _ = self._apply_default_filters(query, results)
+        
+        return results[:top_k]
+    
+    def _merge_search_results(
+        self,
+        original_query: str,
+        original_results: List[Tuple[Chunk, float]],
+        expanded_query: str,
+        expanded_results: List[Tuple[Chunk, float]],
+        top_k: int
+    ) -> List[Tuple[Chunk, float]]:
+        """
+        元のクエリと拡張クエリの検索結果をマージ
+        
+        Args:
+            original_query: 元のクエリ
+            original_results: 元のクエリの検索結果
+            expanded_query: 拡張クエリ
+            expanded_results: 拡張クエリの検索結果
+            top_k: 最終的に取得するチャンク数
+            
+        Returns:
+            マージ後の検索結果
+        """
+        # チャンクIDをキーとして結果を統合
+        merged_scores: Dict[str, Tuple[Chunk, float, float]] = {}
+        
+        # 元のクエリの結果を追加（重み: 1.0）
+        for chunk, score in original_results:
+            chunk_id = chunk.chunk_id if chunk.chunk_id else chunk.content[:50]  # チャンクIDまたは内容の一部
+            merged_scores[chunk_id] = (chunk, score, 1.0)
+        
+        # 拡張クエリの結果を追加（重み: expansion_weight）
+        for chunk, score in expanded_results:
+            chunk_id = chunk.chunk_id if chunk.chunk_id else chunk.content[:50]
+            if chunk_id in merged_scores:
+                # 既に存在する場合は、重み付き平均でスコアを更新
+                orig_chunk, orig_score, orig_weight = merged_scores[chunk_id]
+                new_weight = orig_weight + self.expansion_weight
+                new_score = (orig_score * orig_weight + score * self.expansion_weight) / new_weight
+                merged_scores[chunk_id] = (chunk, new_score, new_weight)
+            else:
+                # 新規の場合は拡張クエリの重みで追加
+                merged_scores[chunk_id] = (chunk, score, self.expansion_weight)
+        
+        # スコアでソート
+        merged_list = [
+            (chunk, score) for chunk, score, _ in merged_scores.values()
+        ]
+        merged_list.sort(key=lambda x: x[1], reverse=True)
+        
+        return merged_list[:top_k]
 
